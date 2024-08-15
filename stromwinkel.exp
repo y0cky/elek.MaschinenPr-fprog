@@ -1,0 +1,205 @@
+
+#R_TRIG_Inst(CLK := #Start, //Signal #Start auf positive Flanke abfragen
+             Q => #FPStart);
+
+//Stopbedingungen: bei Fehler, Abbruch oder Einschaltsperre der FUs
+IF ("SINA_SPEED_TLG20_DB".error OR "SinaSpeed_DB".Lockout OR "SO_Power_DB".AxisError OR "Keba_Statusword".%X6 OR #Abbruch) THEN
+    #Stop := TRUE;
+    #Schritt := 9;
+//ELSIF NOT #Start AND #statStart THEN
+  //  #Schritt := 9;
+ELSE
+    #Stop := False;
+END_IF;
+
+IF #Schritt = 7 THEN  //Timer zur verzögerten Ausführung des Messskriptes in WinCC
+    #StartTimer := TRUE;
+ELSE
+    #StartTimer := FALSE;
+END_IF;
+
+#IEC_Timer_Inst(IN := #StartTimer,
+                PT := T#2s,
+                Q => #Timer,
+                ET => #VergZeit);
+
+//wenn Signal #Start positive Flanke hat und kein Fehler ansteht und Schützausgang für FU Spannung gesetzt ist, Werte initialisieren
+IF #FPStart AND NOT #Stop AND "7K2" THEN
+    #statStart := TRUE;
+    #Schritt := 0;
+    #m := 0;
+    #n := 0;
+    #phi := 0;
+    #i := 0;
+    #j := 0;
+    #statReal := 0.0;
+    #Messung := 0;
+END_IF;
+
+
+IF #statStart THEN
+    
+    CASE #Schritt OF
+        0: //Vorgabewerte von HMI auslesen
+            "ZES".Messprogramm := 2;
+            "Daten".StartStringAuslesen := TRUE; //-> FB14 StringAuslesen
+            "HMI".Bedienfreigabe := false; //Handbedienung ausschalten
+            IF "StringAuslesen_DB".Fertig THEN
+                #Schritt += 1;
+            END_IF; 
+        1: //Werte für Drehzahlen, Ströme und Stromwinkel setzen
+            "Daten".StartStringAuslesen := FALSE;
+            WHILE #statReal < #nEnde DO
+                #statReal := #nStart + #nSchrittweite * #j;
+                #Drehzahl[#j] := #statReal;
+                #j += 1;
+            END_WHILE;
+            IF #lastCountN > #j - 1 THEN
+                FOR #y := #j TO #lastCountN DO
+                    #Drehzahl[#y] := 0;
+                END_FOR;
+            END_IF;
+            #lastCountN := #j - 1;
+            
+            #statReal := 0;
+            WHILE #statReal < #iEnde DO
+                #statReal := #iStart + #iSchrittweite * #i;
+                #Strom_Effektivwert[#i] := #statReal;
+                #i += 1;
+            END_WHILE;
+            IF #lastCountI > #i - 1 THEN
+                FOR #y := #i TO #lastCountI DO
+                    #Strom_Effektivwert[#y] := 0;
+                END_FOR;
+            END_IF;
+            #lastCountI := #i - 1;
+            
+            IF #lastCountPhi > #WinkelAnzahl THEN
+                FOR #y := #WinkelAnzahl +1 TO #lastCountPhi DO
+                    #Stromwinkel[#y] := 0;
+                END_FOR;
+            END_IF;
+            #lastCountPhi := #WinkelAnzahl;
+            //Dateinamen für DataLogging bilden
+            #Uhrzeit.RetVal := RD_LOC_T(#Uhrzeit.Zeit);
+            #ZeitstempelDTL := "LGF_DTLtoString_DE"("date" := #Uhrzeit.Zeit, separator := '-');
+            //Funktion DTLtoString liefert String mit Länge 29 im Format DD-MM-YYYY HH:MM:SS.NSNSNSNSNSNSNSNSNS
+            //In Dateiname des DataLogging dürfen keine Leerzeichen vorhanden sein, Leerstellen werden nicht benötigt
+            //Leerzeichen an Position 11 löschen und alles hinter Position 19 (.Nanosekunden) verwerfen
+            "DataLogging_DB".name := CONCAT(IN1 := 'Mess_LUT_', IN2 := DELETE(IN := LEFT(IN:=#ZeitstempelDTL,L:=19), L := 1, P := 11));
+            #Schritt += 1;
+            
+        2:    //Drehzahl für Sinamics vorgeben und Lastmaschine starten
+            "Daten".Sinamics.SW := #Drehzahl[#n];
+            "Daten".Sinamics.Freigabe := true;
+            IF "Sinamics_Statusword".%X2 AND "Sinamics_Statusword".%X8 THEN //RM Sinamics in Betrieb und Ziel erreicht
+                #Schritt += 1;
+            END_IF;
+        
+        3: //Id- und Iq-Werte für Keba berechnen, schreiben und Prüfmaschine starten
+            "Daten".Keba_Stromreg.Effektivwert := #Strom_Effektivwert[#m];
+            "HMI".Ieff_Keba := "Daten".Keba_Stromreg.Effektivwert;
+            "Daten".Keba_Stromreg.Stromwinkel := #Stromwinkel[#phi];
+            "HMI".Winkel_Keba := "Daten".Keba_Stromreg.Stromwinkel;
+            "Daten".Keba_Stromreg.Berechnung := true; //->FC9 UmrechnungStromKeba
+            #Schritt += 1;
+        4:
+            IF "SO_WriteDPV1_DB1".Done AND NOT "Daten".Keba_Stromreg.Berechnung  THEN //Stromwerte Keba geschrieben
+                #Schritt += 1;
+                "Daten".Keba.Freigabe := true;
+            END_IF;
+        5:
+            IF "Keba_Statusword".%X2 AND "Keba_Statusword".%X10 AND "Sinamics_Statusword".%X8 THEN //RM Keba in Betrieb und Ziel erreicht bei beiden FUs
+                "ZES".NummerMessung := #Messung;
+                "ZES".AnzahlMessungen := (#j * #i * (#WinkelAnzahl+1)) - 1;
+                "DataLogging_DB".dataLogEntries := INT_TO_UINT(#j * #i * (#WinkelAnzahl +1));
+                
+                "ZES".Drehzahl := #Drehzahl[#n];
+                //"HMI".Ieff_Keba := #Strom_Effektivwert[#m];
+                "ZES".Stromwinkel := #Stromwinkel[#phi];
+                "ZES".StartMessung := true; //-> WinCC-Skript starten
+                #Schritt += 1;
+            END_IF;
+            
+        6: //Warten, bis WinCC Skript fertig ist und DataLogging starten
+            IF "ZES".SPSAuslesen THEN //Bit wird von WinCC-Skript gesetzt, startet DataLogging ->FB12 WinCCDataLog_V2
+                "ZES".StartMessung := false;
+                #Schritt += 1;
+            END_IF;
+        7: //Warten, bis DataLogging fertig und Timer abgelaufen ist
+            IF NOT "ZES".SPSAuslesen AND #Timer THEN
+                #Schritt += 1;
+            END_IF;
+        8: //Überprüfen, ob nächster Punkt angefahren wird oder Messung zu Ende ist
+            CASE "ZES".ReihenfolgeSchleifenMessI OF
+                0: //Reihenfolge: Stromwinkel, Stromeffektivwerte, Drehzahlen
+                    IF #phi < #WinkelAnzahl THEN
+                        #phi += 1;
+                        #Schritt := 3;
+                        #Messung += 1;
+                    ELSIF #m < #i - 1 THEN
+                        #phi := 0;
+                        #m += 1;
+                        #Schritt := 3;
+                        #Messung += 1;
+                    ELSIF #n < #j - 1 THEN
+                        #m := 0;
+                        #phi := 0;
+                        #n += 1;
+                        #Schritt := 2;
+                        #Messung += 1;
+                    ELSE
+                        #Schritt := 9;
+                    END_IF;
+                    ;
+                1: //Reihenfolge: Stromeffektivwerte, Stromwinkel, Drehzahlen
+                    IF #m < #i - 1 THEN
+                        #m += 1;
+                        #Schritt := 3;
+                        #Messung += 1;
+                    ELSIF #phi < #WinkelAnzahl THEN
+                        #m := 0;
+                        #phi += 1;
+                        #Schritt := 3;
+                        #Messung += 1;
+                    ELSIF #n < #j - 1 THEN
+                        #m := 0;
+                        #phi := 0;
+                        #n += 1;
+                        #Schritt := 2;
+                        #Messung += 1;
+                    ELSE
+                        #Schritt := 9;
+                    END_IF;
+                    //Erweiterung der CASE-Anweisung für andere Reihenfolgen möglich
+                    //zusätzlich Anpassung auf HMI-Bild und der Textliste
+                ELSE  // Statement section ELSE
+                    ;
+            END_CASE;
+       
+        9: //Ende, alles zurücksetzen
+            "Daten".Sinamics.Freigabe := FALSE;
+            "Daten".Keba.Freigabe := FALSE;
+            "Daten".Sinamics.SW := 0.0;
+            "Daten".Keba_Stromreg.Effektivwert := 0;
+            "Daten".Keba_Stromreg.Stromwinkel := 0;
+            #statStart := false;
+            IF #Abbruch THEN //bei Abbruch weitere Werte zurücksetzen und angefangenes DataLog löschen
+                "DataLogging_DB".write := False;
+                "DataLogging_DB".delete := TRUE;
+                "ZES".SPSAuslesen := false;
+                "ZES".StartMessung := false;
+                "Daten".StartStringAuslesen := FALSE;
+            ELSIF NOT #Abbruch THEN
+                "HMI".Bedienfreigabe := true;
+                "HMI".FUSpannung := true;
+                "HMI".Ieff_Keba := "Daten".Keba_Stromreg.Effektivwert;
+                "HMI".Winkel_Keba := "Daten".Keba_Stromreg.Stromwinkel;
+                "Daten".Keba_Stromreg.Berechnung := true;
+                "ZES".Stromwinkel := 0.0;
+                "HMI".Ieff_Keba := 0.0;
+            END_IF;
+        ELSE  // Statement section ELSE
+            ;
+    END_CASE;
+END_IF;
