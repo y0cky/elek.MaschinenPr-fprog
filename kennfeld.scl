@@ -1,3 +1,18 @@
+// Überarbeitung Johannes Wilhelm Juli 2024
+
+// Changelog:
+// Stop trigger extern hinzugefügt
+// Prozessfortschritt in % hinzugefüht
+// Berechnen von Leistungen aller Arbeitspunkte
+// Variable Anzahl Messpunkte
+
+
+// Todo
+// Leistungsarray nach größe sortieren
+// Steuerung nach Leistungsarray
+
+
+// Trigger erkennen
 #R_TRIG_InstStart(CLK := #Start,
                   Q => #FPStart); // Flankenerkennung für Start
 #R_TRIG_InstStop(CLK := #Stop,
@@ -6,31 +21,25 @@
 //Stopbedingungen: bei Fehler, Abbruch oder Einschaltsperre der FUs
 IF ("SINA_SPEED_TLG20_DB".error OR "SinaSpeed_DB".Lockout OR "SO_Power_DB".AxisError OR "Keba_Statusword".%X6 OR #Abbruch OR #FPStop) THEN
     #Stop := TRUE;
-    #Schritt := 9;
-//ELSIF NOT #Start AND #statStart THEN
-   // #Schritt := 7;
+    #Schritt := 8;
+    //ELSIF NOT #Start AND #statStart THEN
+    // #Schritt := 7;
 ELSE
     #Stop := False;
 END_IF;
 
-//wenn Signal #Start positive Flanke hat, kein Fehler ansteht und Schützausgang für FU Spannung gesetzt ist, Werte initialisieren
+//wenn Signal #Start positive Flanke hat und kein Fehler ansteht, Werte initialisieren
 IF #FPStart AND NOT #Stop AND "7K2" THEN
     #statStart := TRUE;
     #Schritt := 0;
-    #m := 0;
     #n := 0;
-    #i := 0;
-    #j := 0;
-    #y := 0;
-    #x := 0;
-    #statReal := 0.0;
     #Messung := 0;
     #Schleife := FALSE;
-    #Mmax := 1000;
+    #Index := 0;
     "HMI".Messzyklen := "HMI".AnzahlMesszyklenAC;
 END_IF;
 
-IF #Schritt = 7 THEN //Timer zur verzögerten Ausführung des Messskriptes in WinCC
+IF #Schritt = 6 THEN //Timer zur verzögerten Ausführung des Messskriptes in WinCC
     #StartTimer := TRUE;
 ELSE
     #StartTimer := FALSE;
@@ -44,48 +53,29 @@ END_IF;
 IF #statStart THEN
     
     CASE #Schritt OF
-        0: //Vorgabewerte von HMI auslesen
+            
+        0: // Messpunkte definieren
+
             "ZES".Messprogramm := 1;
-            "Daten".StartStringAuslesen := TRUE; //-> FB14 StringAuslesen
             "HMI".Bedienfreigabe := false; //Handbedienung ausschalten
-            IF "StringAuslesen_DB".Fertig THEN
-                #Schritt += 1;
-            END_IF;
-        1: //Werte für Drehzahlen und Drehmomente setzen
-            "Daten".StartStringAuslesen := FALSE;
-            WHILE #statReal < #nEnde DO
-                #statReal := #nStart + #nSchrittweite * #j;
-                #Drehzahl[#j] := #statReal;
-                #j += 1;
-            END_WHILE;
-            IF #lastCountN > #j - 1 THEN
-                FOR #y := #j TO #lastCountN DO
-                    #Drehzahl[#y] := 0.0;
-                END_FOR;
-            END_IF;
-            #lastCountN := #j - 1;
             
-            #statReal := 0;
-            WHILE #statReal < #MEnde DO
-                #statReal := #MStart + #MSchrittweite * #i;
-                #Drehmoment[#i] := #statReal;
-                #i += 1;
-            END_WHILE;
-            IF #lastCountM > #i - 1 THEN
-                FOR #y := #i TO #lastCountM DO
-                    #Drehmoment[#y] := 0.0;
-                END_FOR;
-            END_IF;
-            #lastCountM := #i - 1;
-            IF #lastCountMmax > #AnzahlFeldschwächung THEN
-                FOR #y := #AnzahlFeldschwächung + 1 TO #lastCountMmax DO
-                    #Feldschwächung[#y].n := 0.0;
-                    #Feldschwächung[#y].Mmax := 0.0;
-                END_FOR;
-            END_IF;
-            #lastCountMmax := #AnzahlFeldschwächung;
+            #AnzahlMesspunkte := 0;
             
-            //Dateinamen für DataLogging bilden
+            FOR #a := 0 TO 9999 DO
+                #Messpunkt[#a].index := "Messpunkte_DB".index[#a];
+                #Messpunkt[#a].drehzahl := "Messpunkte_DB".drehzahl[#a];
+                #Messpunkt[#a].drehmoment := "Messpunkte_DB".drehmoment[#a];
+                
+                // Prüfe, ob Auslesen beendet und setzte Anzahl der Messpunkte = höchster Indexwert
+                IF #a > 0 AND #Messpunkt[#a].index = 0 THEN
+                    #AnzahlMesspunkte := #Messpunkt[#a - 1].index;
+                    EXIT;
+                END_IF;
+            END_FOR;
+            
+            #Schritt += 1;
+            
+        1:  //Dateinamen für DataLogging bilden
             #Uhrzeit.RetVal := RD_LOC_T(#Uhrzeit.Zeit);
             #ZeitstempelDTL := "LGF_DTLtoString_DE"("date" := #Uhrzeit.Zeit, separator := '-');
             //Funktion DTLtoString liefert String mit Länge 29 im Format DD-MM-YYYY HH:MM:SS.NSNSNSNSNSNSNSNSNS
@@ -93,126 +83,77 @@ IF #statStart THEN
             //Leerzeichen an Position 11 löschen und alles hinter Position 19 (.Nanosekunden) verwerfen
             "DataLogging_DB".name := CONCAT(IN1 := 'Mess_Kennfeld_', IN2 := DELETE(IN := LEFT(IN := #ZeitstempelDTL, L := 19), L := 1, P := 11));
             #Schritt += 1;
-           
-        2: //Drehzahl für Sinamics vorgeben und Lastmaschine starten
-            IF "Daten".FrgUmschaltung = True AND NOT "7K2" THEN
-                "Daten".SchützFU := TRUE;
-            ELSIF "7K2" THEN
-                FOR #x := 0 TO #AnzahlFeldschwächung DO
-                    IF #Feldschwächung[#x].n > 0.0 THEN
-                        IF #Drehzahl[#n] = #Feldschwächung[#x].n THEN
-                            #Mmax := #Feldschwächung[#x].Mmax;
-                            EXIT;
-                        ELSIF #Drehzahl[#n] > #Feldschwächung[#AnzahlFeldschwächung].n THEN
-                            #Mmax := #Feldschwächung[#AnzahlFeldschwächung].Mmax;
-                            EXIT;
-                        ELSIF #Drehzahl[#n] > #Feldschwächung[#x].n AND #Drehzahl[#n] < #Feldschwächung[#x + 1].n THEN
-                            #Mmax := #Feldschwächung[#x + 1].Mmax;
-                            EXIT;
-                        ELSE
-                            #Mmax := 1000;
-                        END_IF;
-                    END_IF;
-                END_FOR;
-                "Daten".Sinamics.SW := #Drehzahl[#n];
-                "Daten".Sinamics.Freigabe := true;
-                IF "Sinamics_Statusword".%X2 AND "Sinamics_Statusword".%X8 THEN //RM Sinamics in Betrieb und Ziel erreicht
-                    #Schritt += 1;
-                END_IF;
-            END_IF;
-        3: //Drehmoment für Keba vorgeben, Prüfmaschine starten und anschließend über WinCC Messung starten
-            IF #Drehmoment[#m] > #Mmax THEN
-                    "Daten".Keba.SW := #Mmax;
-                    "ZES".Drehmoment := #Mmax;
-                ELSE
-                    "Daten".Keba.SW := #Drehmoment[#m];
-                    "ZES".Drehmoment := #Drehmoment[#m];
-                END_IF;
-                
-                "Daten".Keba.Freigabe := true;
-                IF "Keba_Statusword".%X2 AND "Keba_Statusword".%X10 AND "Sinamics_Statusword".%X8 THEN //RM Keba in Betrieb und Ziel erreicht bei beiden FUs
-                    #Schritt := 5;
-                    "ZES".Drehzahl := #Drehzahl[#n];
-                END_IF;
-                
-        4:
-            IF "Daten".FrgUmschaltung = TRUE AND NOT "6K1" THEN
-                "Daten".SchützDC := TRUE;
-            ELSIF "6K1" THEN
+            
+        2: //Drehzahl vorgeben und Lastmaschine starten
+            
+            "Daten".Sinamics.SW := #Messpunkt[#Messung].drehzahl;
+            "ZES".Drehzahl := #Messpunkt[#Messung].drehzahl;
+            "Daten".Sinamics.Freigabe := true;
+            IF "Sinamics_Statusword".%X2 AND "Sinamics_Statusword".%X8 THEN //RM Sinamics in Betrieb und Ziel erreicht
                 #Schritt += 1;
             END_IF;
-        5:
+            
+        3: //Drehmoment für Keba vorgeben, Prüfmaschine starten und anschließend über WinCC Messung starten
+            "Daten".Keba.SW := #Messpunkt[#Messung].drehmoment;
+            "ZES".Drehmoment := #Messpunkt[#Messung].drehmoment;
+            
+            "Daten".Keba.Freigabe := true;
+            
+            IF "Keba_Statusword".%X2 AND "Keba_Statusword".%X10 AND "Sinamics_Statusword".%X8 THEN //RM Keba in Betrieb und Ziel erreicht bei beiden FUs
+                #Schritt += 1;
+            END_IF;
+        4: // Starte Messung
             "ZES".NummerMessung := #Messung;
-            "ZES".AnzahlMessungen := (2*#j * #i) - 1; //doppelte Anzahl Messungen mit Stillstandsmessung
-            "DataLogging_DB".dataLogEntries := INT_TO_UINT(2*#j * #i);
+            "ZES".AnzahlMessungen := #AnzahlMesspunkte;
+            "DataLogging_DB".dataLogEntries := INT_TO_UINT(#AnzahlMesspunkte + 1);
+            
             "ZES".StartMessung := true; //-> WinCC-Skript starten
+            
             #Schritt += 1;
-        6: //Warten, bis WinCC Skript fertig ist und DataLogging starten
+            
+            
+        5: //Warten, bis WinCC Skript fertig ist und DataLogging starten
             IF "ZES".SPSAuslesen THEN //Bit wird von WinCC-Skript gesetzt, startet DataLogging ->FB12 WinCCDataLog_V2
                 "ZES".StartMessung := false;
                 #Schritt += 1;
             ELSIF "HMI".Fehler_Skript THEN
                 IF #Schleife = false THEN //bei erstmaligem Fehler
-                    "ZES".StartMessung := false; //Messung neustarten und zurück in Schritt 5
+                    "ZES".StartMessung := false; //Messung neustarten und zurück in Schritt 2
                     "HMI".Fehler_Skript := false; //Fehlervariable zurücksetzen, falls WinCC zu langsam
                     #Schleife := true;
-                    #Schritt := 5;
+                    #Schritt := 2;
                 ELSIF #Schleife THEN //bei erneutem Fehler Abbruch
-                    #Schritt := 9;
+                    #Schritt := 7;
                 END_IF;
             END_IF;
-        7: //Warten, bis DataLogging fertig und Timer abgelaufen ist
+            
+        6: //Warten, bis DataLogging fertig und Timer abgelaufen ist
             IF NOT "ZES".SPSAuslesen AND #Timer THEN
                 #Schritt += 1;
             END_IF;
-        8: //Überprüfen, ob nächster Punkt angefahren wird oder Messung zu Ende ist
-            #Messung += 1;
             
+        7: //Überprüfen, ob nächster Punkt angefahren wird oder Messung zu Ende ist
+            #Index := (100 / #AnzahlMesspunkte) * (#Messung + 1);
             
-            
-            IF #Messung MOD 2 = 0 THEN
-                "Daten".SchützDC := False;
-                "HMI".Messzyklen := "HMI".AnzahlMesszyklenAC;
-                CASE "ZES".ReihenfolgeSchleifenMessKenn OF
-                    0:  //Reihenfolge: Drehmomente, Drehzahlen
-                        IF #m < #i - 1 THEN
-                            #m += 1;
-                            #Schritt := 2;
-                        ELSIF #n < #j - 1 THEN
-                            #m := 0;
-                            #n += 1;
-                            #Schritt := 2;
-                        ELSE
-                            #Schritt := 9;
-                        END_IF;
-                    1:  //Reihenfolge: Drehzahlen, Drehmomente
-                        IF #n < #j - 1 THEN
-                            #n += 1;
-                            #Schritt := 2;
-                        ELSIF #m < #i - 1 THEN
-                            #n := 0;
-                            #m += 1;
-                            #Schritt := 2;
-                        ELSE
-                            #Schritt := 9;
-                        END_IF;
-                    ELSE  // Statement section ELSE
-                        ;
-                END_CASE;
-            ELSIF #Messung MOD 2 > 0 THEN
-                "HMI".Messzyklen := "HMI".AnzahlMesszyklenDC;
-                "Daten".SchützFU := False;
-                "Daten".Sinamics.Freigabe := false;
-                "Daten".Keba.Freigabe := false;
-                #Schritt := 4;
+            IF #Messung < #AnzahlMesspunkte THEN
+                #n += 1;
+                #Messung += 1;
+                
+                #Schritt := 2;
+            ELSE
+                #Schritt += 1;
             END_IF;
-        9: //Ende, alles zurücksetzen
+            
+            
+            
+        8: //Ende, alles zurücksetzen
             "Daten".Sinamics.Freigabe := FALSE;
             "Daten".Keba.Freigabe := FALSE;
             "Daten".Sinamics.SW := 0.0;
             "Daten".Keba.SW := 0.0;
             "ZES".Messprogramm := 0;
             #statStart := false;
+            #Index := 0;
             IF #Abbruch THEN //bei Abbruch weitere Werte zurücksetzen und angefangenes DataLog löschen
                 "DataLogging_DB".write := False;
                 "DataLogging_DB".delete := TRUE;
@@ -222,7 +163,6 @@ IF #statStart THEN
             ELSIF NOT #Abbruch THEN
                 "HMI".Bedienfreigabe := true;
                 "HMI".FUSpannung := true;
-                "ZES".Drehmoment := 0.0;
             END_IF;
         ELSE  // Statement section ELSE
             ;
