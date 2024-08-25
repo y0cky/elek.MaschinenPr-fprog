@@ -1,0 +1,231 @@
+// Überarbeitung Johannes Wilhelm Juli 2024
+
+// Changelog:
+// Stop trigger extern hinzugefügt
+// Prozessfortschritt in % hinzugefüht
+// Berechnen von Leistungen aller Arbeitspunkte
+// Variable Anzahl Messpunkte
+// Stillstandsmessung
+// 
+
+
+
+// Trigger erkennen
+#R_TRIG_InstStart(CLK := #Start,
+                  Q => #FPStart); // Flankenerkennung für Start
+#R_TRIG_InstStop(CLK := #Stop,
+                 Q => #FPStop); // Flankenerkennung für Stop
+
+//Stopbedingungen: bei Fehler, Abbruch oder Einschaltsperre der FUs
+IF ("SINA_SPEED_TLG20_DB".error OR "SinaSpeed_DB".Lockout OR "SO_Power_DB".AxisError OR "Keba_Statusword".%X6 OR #Abbruch OR #FPStop) THEN
+    // #Stop := TRUE;
+    // #Abbruch := TRUE;
+    #Schritt := 9;
+    // #Start := false;
+    //ELSIF NOT #Start AND #statStart THEN
+    // #Schritt := 7;
+// ELSE
+    // #Stop := False;
+END_IF;
+
+//wenn Signal #Start positive Flanke hat und kein Fehler ansteht, Werte initialisieren
+IF #FPStart AND "7K2" THEN
+    #statStart := TRUE;
+    #Schritt := 0;
+    #n := 0;
+    #Messung := 0;
+    #Schleife := FALSE;
+    #AnzahlMesspunkte := 0;
+    #Stillstandsmessung := 0;
+    #a := 0;
+    "Messwerte kopieren_DB".CLEAR := true;
+END_IF;
+
+
+
+IF #statStart THEN
+    
+    CASE #Schritt OF
+            
+        0: // Messpunkte definieren und Werte initialisieren
+            // Messprogramm 1 = Kennfeldmessung 2 = Stromwinkelmessung
+            "ZES".Messprogramm := 1;
+            "HMI".Bedienfreigabe := false; //Handbedienung ausschalten
+            // Freigabe für Schützautomatik
+            "Daten".SchützAutomatikprogramm := true;
+            // Anzahl Messzyklen für Mittelwertbildung: erste Messung immer AC Messung
+            "HMI".Messzyklen := "HMI".AnzahlMesszyklenAC;
+
+            "MesspunkteEinlesen_DB"(
+                Start := TRUE,
+                AnzahlMesspunkte => #AnzahlMesspunkte,
+                Messpunkte_DB => "Messpunkte_DB",
+                Messpunkt => #Messpunkt,
+                MesspunkteEinlesenFertig => #MesspunkteEinlesenFertig
+            );
+            IF #MesspunkteEinlesenFertig THEN
+                #Schritt += 1;
+            END_IF;
+            
+            // Werte von Schnittstelle DB zu Pythonscript kopieren
+            FOR #a := 0 TO 999 DO
+                #Messpunkt[#a].index := "Messpunkte_DB".index[#a];
+                #Messpunkt[#a].drehzahl := "Messpunkte_DB".drehzahl[#a];
+                #Messpunkt[#a].drehmoment := "Messpunkte_DB".drehmoment[#a];
+                
+                // Prüfe, ob Auslesen beendet und setzte Anzahl der Messpunkte = höchster Indexwert
+                IF #a > 0 AND #Messpunkt[#a].index = 0 THEN
+                    #AnzahlMesspunkte := #Messpunkt[#a - 1].index;
+                    // Wenn DC Messung verdoppel Anzahl der Messpunkte
+                    IF #DCMessung THEN
+                        #AnzahlMesspunkte := ((#AnzahlMesspunkte + 1) * 2) - 1;
+                    END_IF;
+                    EXIT;
+                END_IF;
+                
+                
+            END_FOR;
+            
+            #a := 1;
+            #Schritt += 1;
+        2:
+            // Umschlatung Schütze
+            // MessungTyp: 0 = Stillstandsmessung, 1 = DC Messung, 2 = AC Messung
+            "SchuetzSteuerung_DB"(MessungTyp:=NOT #Stillstandsmessung,
+                                  SteuerungsFertig=>#SteuerungsFertig);
+            IF #SteuerungsFertig THEN
+                #Schritt := 3; // Nächster Schritt
+            END_IF;
+            
+        3: //Maschinen starten wenn keine Stillstandsmessung
+            IF NOT #Stillstandsmessung THEN
+                "ArbeitspunktAnfahren_DB"(n_soll := #Messpunkt[#n].drehzahl,
+                                          M_soll := #Messpunkt[#n].drehmoment,
+                                          Start := true,
+                                          Erfolg => #ArbeitpunktErreicht);
+            END_IF;
+        4:
+            IF #ArbeitpunktErreicht THEN
+                // Starte Messung
+                "MessungZES_DB"  (start:=TRUE,
+                              NummerMessung:=#Messung,
+                              AnzahlMessungen:=#AnzahlMesspunkte,
+                              MessungFertig=>#MessungFertig);
+                #Schritt += 1;
+            END_IF;
+        6:  // Warte bis Messung fertig
+            IF #MessungFertig THEN
+                IF "DataLogging_DB".Data.Temperatur >= #Betriebstemp THEN
+                    // Maschine auf Betriebstemperatur, weiter
+                    #Schritt += 8;
+                ELSE
+                    // Maschine unterkühlt, warte bis Betriebstemperatur erreicht
+                    // Arbeitspunkt mit hoher belastung anfahren
+                    CASE #Schritt OF
+                        6:
+                            // Arbeitspunkt anfahren
+                            "ArbeitspunktAnfahren_DB"(n_soll := 500,
+                                                      M_soll := 50,
+                                                      Start := true,
+                                                      Erfolg => #ArbeitpunktErreicht);
+                            IF #ArbeitpunktErreicht THEN
+                                #IEC_Timer_Inst(IN := true,
+                                                PT := T#30s,
+                                                Q => #Timer,
+                                                ET => #VergZeit);
+                                #Schritt += 1;
+                            END_IF;
+                        7:
+                            IF #Timer THEN
+                                #Schritt += 1;
+                            END_IF;
+
+                        8:  // Starte Messung
+                            "MessungZES_DB"  (start:=TRUE,
+                                          NummerMessung:=#Messung,
+                                          AnzahlMessungen:=#AnzahlMesspunkte,
+                                          MessungFertig=>#MessungFertig);
+                            #Schritt += 1;
+                            // Warte bis Messung fertig
+                            IF #MessungFertig THEN
+                                #Schritt += 1;
+                            END_IF;
+                        9:
+                            // Maschine auf Betriebstemperatur, weiter
+                            IF "DataLogging_DB".Data.Temperatur >= #Betriebstemp THEN
+                                #Schritt += 3;
+                            ELSE
+                                // Maschine unterkühlt, warte bis Betriebstemperatur erreicht
+                                #Schritt := 6;
+                            END_IF;
+                    END_CASE;
+                END_IF;
+            END_IF;
+        
+        8: //Überprüfen, ob nächster Punkt angefahren wird oder Messung zu Ende ist
+            // Ende erreicht?
+            IF #Messung < #AnzahlMesspunkte THEN
+                // Ende nicht erreicht, nächster Punkt
+                #Messung += 1;
+                // Ohne DC Messung direkt zu Schritt 2.
+                IF NOT #DCMessung THEN
+                    #n += 1;
+                    #Schritt := 2;
+                    // Mit DC Messung Fallunterscheidung: #Messung Gerade = DC Messung, Ungerade = AC Messung
+                ELSIF #DCMessung THEN
+                    IF (#Messung MOD 2) = 0 THEN    // Anzahl Messung gerade
+                        //AC Messung
+                        #n += 1;                    //nächster Arbeitspunkt aus CSV
+                        "HMI".Messzyklen := "HMI".AnzahlMesszyklenAC;       // Anzahl an Messwerten für Mittelwertbildung
+                        #Stillstandsmessung := FALSE;                       // nächte Messung mit FU Schütz
+                        #Schritt := 2;
+                    ELSIF (#Messung MOD 2) = 1 THEN
+                        // DC Messung
+                        "HMI".Messzyklen := "HMI".AnzahlMesszyklenDC;       // Anzahl an Messwerten für Mittelwertbildung
+                        #Stillstandsmessung := TRUE;                        // nächste Messung mit DC Schütz
+                        "ArbeitspunktAnfahren_DB".Stop := TRUE;
+                        #IEC_Timer_Inst(IN := TRUE,
+                                        PT := T#1s,
+                                        Q => #Timer,
+                                        ET => #VergZeit);
+                        IF #Timer THEN
+                            #Schritt := 2;
+                    END_IF;
+                END_IF;
+            ELSE
+                // Alle Arbeitspunkte abgearbeitet, Ende
+                #Schritt += 1;
+            END_IF;
+        
+        9: //Ende, alles zurücksetzen
+            "Daten".Sinamics.Freigabe := FALSE;
+            "Daten".Keba.Freigabe := FALSE;
+            "Daten".Sinamics.SW := 0.0;
+            "Daten".Keba.SW := 0.0;
+            "ZES".Messprogramm := 0;
+            #statStart := false;
+            #Start := FALSE;
+            #Stop := FALSE;
+            "Daten".SchützAutomatikprogramm := false;
+            "Daten".AuslesenStart := FALSE;
+            #Stillstandsmessung := false;
+            #a := 0;
+            #AnzahlMesspunkte := 0;
+            "ZES".SPSAuslesen := false;
+            "ZES".StartMessung := false;
+            "Daten".StartStringAuslesen := FALSE;
+            
+            IF #Abbruch THEN //bei Abbruch weitere Werte zurücksetzen und angefangenes DataLog löschen
+                "DataLogging_DB".write := False;
+                "DataLogging_DB".delete := TRUE;
+                "HMI".Bedienfreigabe := true;
+                "HMI".FUSpannung := true;
+            ELSIF NOT #Abbruch THEN
+                "HMI".Bedienfreigabe := true;
+                "HMI".FUSpannung := true;
+            END_IF;
+            #Abbruch := FALSE;
+            #Schritt := 0;
+            
+    END_CASE;
+END_IF;
